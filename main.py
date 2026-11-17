@@ -4,6 +4,11 @@ from pathlib import Path
 
 from detection_display_class import Detection, Display, FaceDetector, FrameCapture, PeopleManager
 
+camera_index = [0, 1, 2]
+camera_amount = len(camera_index)
+queue_size = 2
+appearance_refresh = 5
+
 class App:
     def __init__(self, detection, display, face_detector, capture):
         self.detection = detection
@@ -31,13 +36,13 @@ def main():
     if photo_folder is None:
         print("No known faces found")
 
-    people_manager = PeopleManager()
-    face_detector = FaceDetector(2, photo_folder, people_manager)
-    capture = FrameCapture(0, 2)
-    detection = Detection(0.6, 0.5, 2, capture, people_manager, face_detector, 5)
-    display = Display(detection, people_manager)
+    people_manager = PeopleManager(camera_amount=camera_amount)
+    face_detector = FaceDetector(queue_size=queue_size, photo_folder=photo_folder, people_manager=people_manager)
+    capture = FrameCapture(camera_index=camera_index, camera_amount=camera_amount, queue_size=queue_size)
+    detection = Detection(conf=0.6, iou=.5, queue_size=queue_size, capture=capture, people_manager=people_manager, face_detector=face_detector, appearance_refresh=appearance_refresh)
+    display = Display(last_frame_owner=detection, people_manager=people_manager, camera_amount=camera_amount)
 
-    app = App(detection, display, face_detector, capture)
+    app = App(detection=detection, display=display, face_detector=face_detector, capture=capture)
 
     try:
         app.start()

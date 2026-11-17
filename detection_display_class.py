@@ -6,36 +6,39 @@ import threading
 import queue
 import os
 import numpy as np
+from types import SimpleNamespace
+from ultralytics.trackers.byte_tracker import BYTETracker
 
 class Person:
-    def __init__(self, track_id, identity_id):
-        self.track_id = track_id
+    def __init__(self, identity_id, camera_amount):
+        self.track_ids = [None] * camera_amount
         self.last_face_check = 0
         self.name = "Unknown"
         self.verified = False
 
         self.identity_id = identity_id
-        self.appearance = None
+        self.appearance = [None] * camera_amount
         self.last_seen = time.time()
 
 class PeopleManager:
-    def __init__(self):
+    def __init__(self, camera_amount):
         self.people = {}
-        self.track_to_person = {}
+        self.track_to_person = {}  # Holds (camera index, track_id): person
         self.next_identity_id = 1
+        self.camera_amount = camera_amount
 
-    def get_person(self, track_id):
-        return self.track_to_person.get(track_id)
+    def get_person(self, camera_index, track_id):
+        return self.track_to_person.get((camera_index, track_id))
 
-    def update_person(self, track_id, appearance, current_tracks_ids):
-        person = self.track_to_person.get(track_id)
+    def update_person(self, track_id, appearance, current_tracks_ids, camera_index):
+        person = self.get_person(camera_index, track_id)
 
         if person is not None:
             person.last_seen = time.time()
-            person.track_id = track_id
+            person.track_ids[camera_index] = track_id
 
             if appearance is not None:
-                person.appearance = appearance
+                person.appearance[camera_index] = appearance
 
             return person
 
@@ -45,57 +48,94 @@ class PeopleManager:
 
         if appearance is not None:
             for candidate in list(self.people.values()):
-                old_track_id = candidate.track_id
+                old_track_id = candidate.track_ids[camera_index]
 
                 if old_track_id in current_tracks_ids:
                     continue
 
-                if now - candidate.last_seen > 30 or candidate.appearance is None:
+                if now - candidate.last_seen > 30:
                     self.people.pop(candidate.identity_id, None)
-                    self.track_to_person.pop(old_track_id, None)
+                    self.track_to_person.pop((camera_index, old_track_id), None)
                     continue
 
-                distance = cv2.compareHist(
-                    candidate.appearance,
-                    appearance,
-                    cv2.HISTCMP_BHATTACHARYYA
-                )
+                for old_appearance in candidate.appearance:
+                    if old_appearance is None:
+                        continue
 
-                if distance < best_distance:
-                    best_distance = distance
-                    best_person = candidate
+                    distance = cv2.compareHist(
+                        appearance,
+                        old_appearance,
+                        cv2.HISTCMP_BHATTACHARYYA
+                    )
 
-        if best_person is not None and best_distance < 0.25:
+                    if distance < best_distance:
+                        best_distance = distance
+                        best_person = candidate
+        if best_person is not None:
+            print(f"New person - {best_person.identity_id} - {best_distance}")
+
+        if best_person is not None and best_distance < 0.35:
             person = best_person
-            old_track_id = person.track_id
-            person.track_id = track_id
+            old_track_id = person.track_ids[camera_index]
+            person.track_ids[camera_index] = track_id
             person.last_seen = now
-            person.appearance = appearance
-            self.track_to_person[track_id] = person
-            self.track_to_person.pop(old_track_id, None)
+            person.appearance[camera_index] = appearance
+            self.track_to_person[camera_index, track_id] = person
+            if old_track_id is not None:
+                self.track_to_person.pop((camera_index, old_track_id), None)
 
-            print(f"Track_id: {track_id} - matches: {person.identity_id} - (distance={best_distance:.3f}")
+            print(f"Track ID: {track_id} - matches: {person.identity_id} - (distance={best_distance:.3f})")
             return person
 
         identity_id = self.next_identity_id
         self.next_identity_id += 1
-        person = Person(track_id, identity_id)
-        person.appearance = appearance
+        person = Person(identity_id=identity_id, camera_amount=self.camera_amount)
+        person.track_ids[camera_index] = track_id
+        person.appearance[camera_index] = appearance
         person.last_seen = now
 
         self.people[identity_id] = person
-        self.track_to_person[track_id] = person
+        self.track_to_person[camera_index, track_id] = person
 
         return person
 
-    def update_verification(self, track_id, name, verified):
-        person = self.get_person(track_id)
+    def update_verification(self, track_id, name, verified, camera_index):
+        person = self.get_person(camera_index, track_id)
 
-        if person is not None:
-            self.track_to_person[track_id].name = name
-            self.track_to_person[track_id].verified = verified
-            self.people[person.identity_id].name = name
-            self.people[person.identity_id].verified = verified
+        if person is None:
+            return
+
+        person.name = name
+        person.verified = verified
+
+        if not verified or not name or name == "Unknown":
+            return
+
+        for candidate in list(self.people.values()):
+            if candidate is person:
+                continue
+
+            if not candidate.verified or candidate.name != name:
+                continue
+
+            for i in range(self.camera_amount):
+                old_track_id = person.track_ids[i]
+
+                if old_track_id is not None:
+                    candidate.track_ids[i] = old_track_id
+                    self.track_to_person[(i, old_track_id)] = candidate
+
+                if person.appearance[i] is not None:
+                    candidate.appearance[i] = person.appearance[i]
+
+            candidate.last_seen = max(candidate.last_seen, person.last_seen)
+            candidate.last_face_check = max(candidate.last_face_check, person.last_face_check)
+
+            self.people.pop(person.identity_id, None)
+
+            print(f"Merged: Person {person.identity_id} "
+                  f"into {candidate.identity_id} "
+                  f"(name={name})")
 
     def get_people(self):
         return self.people
@@ -175,7 +215,7 @@ class FaceDetector:
             if task is None:
                 break
 
-            track_id, face_crop = task
+            track_id, camera_index, face_crop = task
 
             try:
                 result = DeepFace.represent(img_path=face_crop, model_name="Facenet", detector_backend="opencv", enforce_detection=True)
@@ -185,16 +225,16 @@ class FaceDetector:
 
                 if name is not None:
                     name = name[0].upper() + name[1:].lower()
-                    self.people_manager.update_verification(track_id, name, True)
+                    self.people_manager.update_verification(track_id, name, True, camera_index)
 
             except Exception as error:
-                print(f"Failed to perform face check for track {track_id}", error)
+                print(f"Face check failed - Camera: {camera_index}, ID: {track_id} -", error)
             
             finally:
                 self.face_queue.task_done()
 
-    def add_to_queue(self, track_id, face_crop):
-        self.face_queue.put_nowait((track_id, face_crop))
+    def add_to_queue(self, track_id, camera_index, face_crop):
+        self.face_queue.put_nowait((track_id, camera_index, face_crop))
 
     def stop(self):
         self.running = False
@@ -208,24 +248,35 @@ class FaceDetector:
             self.thread.join(timeout=2.0)
 
 class FrameCapture:
-    def __init__(self, camera_index, queue_size):
+    def __init__(self, camera_index, camera_amount, queue_size):
         self.camera_index = camera_index
         self.frame_queue = queue.Queue(maxsize=queue_size)
+        self.camera_amount = camera_amount
 
-        self.camera = None
+        self.cameras: list[cv2.VideoCapture | None] = [None] * camera_amount
         self.thread = None
         self.running = False
 
     def start(self):
-        self.camera = cv2.VideoCapture(self.camera_index)
+        for i, cam_index in enumerate(self.camera_index):
+            camera = cv2.VideoCapture(cam_index, cv2.CAP_MSMF)
 
-        if not self.camera.isOpened():
-            raise RuntimeError("Could not open camera")
+            if not camera.isOpened():
+                for opened_camera in self.cameras:
+                    if opened_camera is not None:
+                        opened_camera.release()
+                raise RuntimeError(f"Could not open camera {cam_index}")
 
-        # Use 1280x720 to improve face detection without significantly affecting performance.
-        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.camera.set(cv2.CAP_PROP_FPS, 30)
+            # Use 1280x720 to improve face detection without significantly affecting performance.
+            camera.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            camera.set(cv2.CAP_PROP_FPS, 30)
+            camera.set(cv2.CAP_PROP_AUTOFOCUS, 0)  # Disable autofocus
+            camera.set(cv2.CAP_PROP_FOCUS, 100)
+            camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Disable automatic light adjustment
+            camera.set(cv2.CAP_PROP_EXPOSURE, -5)  # Set the manual light adjustment to keep the images as similar as possible
+
+            self.cameras[i] = camera
 
         self.running = True
 
@@ -236,15 +287,27 @@ class FrameCapture:
 
     def _capture_loop(self):
         while self.running:
-            success, frame = self.camera.read()
+            frames = []
+            for i, camera in enumerate(self.cameras):
+                if camera is None:
+                    print(f"Camera {self.camera_index[i]} is None")
+                    continue
+                success, frame = camera.read()
 
-            if not success:
+                if not success:
+                    print(f"Camera {self.camera_index[i]} failed to read a frame")
+                    continue
+
+                frame_data = {
+                    "frame": frame,
+                    "camera": self.camera_index[i],
+                    "timestamp": time.perf_counter()
+                }
+
+                frames.append(frame_data)
+
+            if not frames:
                 continue
-
-            frame_data = {
-                "frame": frame,
-                "timestamp": time.perf_counter()
-            }
 
             if self.frame_queue.full():
                 try:
@@ -253,7 +316,7 @@ class FrameCapture:
                     pass
 
             try:
-                self.frame_queue.put_nowait(frame_data)
+                self.frame_queue.put_nowait(frames)
             except queue.Full:
                 pass
 
@@ -269,9 +332,10 @@ class FrameCapture:
         if self.thread is not None:
             self.thread.join(timeout=2.0)
 
-        if self.camera is not None:
-            self.camera.release()
-            self.camera = None
+        for i, camera in enumerate(self.cameras):
+            if camera is not None:
+                camera.release()
+                self.cameras[i] = None
 
 class Detection:
     def __init__(self, conf, iou, queue_size, capture, people_manager, face_detector, appearance_refresh):
@@ -285,11 +349,17 @@ class Detection:
         self.appearance_frame_count = 0
 
         self.model = None
+        self.trackers = []
+
         self.running = False
         self.thread = None
 
     def start(self):
         self.model = YOLO("yolo11m-pose.engine")
+
+        tracker_args = SimpleNamespace(tracker_type="bytetrack", track_high_thresh=0.25, track_low_thresh=0.1, new_track_thresh=0.25, track_buffer=30, match_thresh=0.8, fuse_score=True)
+        self.trackers = [BYTETracker(args=tracker_args) for _ in range(self.capture.camera_amount)]
+
         self.running = True
         self.thread = threading.Thread(target=self._detection_loop, daemon=True)
         self.thread.start()
@@ -379,44 +449,62 @@ class Detection:
             if data is None:
                 continue
 
-            frame = data["frame"]
+            if len(data) != len(self.trackers):
+                continue
+
+            batch = [frame_data["frame"] for frame_data in data]
             self.appearance_frame_count += 1
             refresh_appearances = (
                 self.appearance_frame_count >= self.appearance_refresh_interval
             )
-            frame_height, frame_width = frame.shape[:2]
-            items = []
+
+            payload = []
             current_time = time.time()
-            results = self.model.track(frame, persist=True, classes=[0], verbose=False, conf=self.conf, iou=self.iou)[0]
+            results = self.model.predict(batch, classes=[0], verbose=False, conf=self.conf, iou=self.iou)
 
-            if results.boxes.id is not None:
-                track_ids = results.boxes.id.int().tolist()
-                current_track_ids = set(track_ids)
+            for i, result in enumerate(results):
+                frame_data = data[i]
+                frame = frame_data["frame"]
+                camera_index = frame_data["camera"]
+                camera = {"capture": frame_data}
+                items = []
+
+                frame_height, frame_width = frame.shape[:2]
+                tracker = self.trackers[camera_index]
+
+                detections = result.boxes.cpu().numpy()
+                tracks = tracker.update(detections, frame)
+                current_track_ids = {int(track[4]) for track in tracks}
                 keypoints = None
-                if results.keypoints is not None:
-                    keypoints = results.keypoints.xy[:, :5].cpu().numpy()
+                if result.keypoints is not None:
+                    keypoints = result.keypoints.xy[:, :5].cpu().numpy()
 
-                for box_index, (box, track_id) in enumerate(zip(results.boxes, track_ids)):
+                for track in tracks:
 
-                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                    x1, y1, x2, y2 = map(int, track[:4])
+                    track_id = int(track[4])
+                    detections_index = int(track[7])
 
                     x1 = max(0, min(x1, frame_width))
                     x2 = max(0, min(x2, frame_width))
                     y1 = max(0, min(y1, frame_height))
                     y2 = max(0, min(y2, frame_height))
 
-                    existing_person = self.people_manager.get_person(track_id)
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+
+                    existing_person = self.people_manager.get_person(camera_index, track_id)
                     should_refresh_appearance = existing_person is None or refresh_appearances
                     appearance = (
                         self.get_appearance(frame, x1, y1, x2, y2) if should_refresh_appearance
                         else None
                     )
 
-                    person = self.people_manager.update_person(track_id, appearance, current_track_ids)
+                    person = self.people_manager.update_person(track_id, appearance, current_track_ids, camera_index)
 
                     face_xxyy = None
-                    if keypoints is not None:
-                        face_xxyy = self.get_face_crop_xxyy(frame, keypoints[box_index])
+                    if keypoints is not None and 0 <= detections_index < len(keypoints):
+                        face_xxyy = self.get_face_crop_xxyy(frame, keypoints[detections_index])
 
                     fx1, fx2, fy1, fy2 = None, None, None, None
                     if face_xxyy is not None:
@@ -430,7 +518,7 @@ class Detection:
                         face_crop = frame[fy1:fy2, fx1:fx2].copy()
                         if face_crop.size > 0:
                             try:
-                                self.face_detector.add_to_queue(track_id, face_crop)
+                                self.face_detector.add_to_queue(track_id, camera_index, face_crop)
                                 person.last_face_check = current_time
                             except queue.Full:
                                 pass
@@ -447,8 +535,8 @@ class Detection:
                         "fy2": fy2
                     }
                     items.append(item)
-
-            payload = {"frame": frame, "items": items}
+                camera["items"] = items
+                payload.append(camera)
 
             if self.frame_queue.full():
                 try:
@@ -477,17 +565,27 @@ class Detection:
             self.thread.join(timeout=2.0)
 
 class Display:
-    def __init__(self, detection, people_manager):
-        self.detection = detection
+    def __init__(self, last_frame_owner, camera_amount, people_manager=None):
+        self.last_frame_owner = last_frame_owner
         self.people_manager = people_manager
+        self.camera_amount = camera_amount
 
-        self.frame_count = 0
-        self.fps_start_time = time.time()
-        self.fps = 0
+        self.frame_objs = []
         self.running = False
 
     def start(self):
+        self.fill_frame_obs()
         self.running = True
+
+    def fill_frame_obs(self):
+        self.frame_objs.clear()
+        for i in range(self.camera_amount):
+            obj = {
+                "frame_count": 0,
+                "fps_start_time": time.time(),
+                "fps": 0
+                }
+            self.frame_objs.append(obj)
 
     @staticmethod
     def get_color(person):
@@ -497,48 +595,66 @@ class Display:
 
     def display_loop(self):
         while self.running:
-            data = self.detection.get_frame()
+            data = self.last_frame_owner.get_frame()
             if data is None:
                 continue
 
-            self.frame_count += 1
-            elapsed = time.time() - self.fps_start_time
+            frame_list = []
 
-            if elapsed >= 1.0:
-                self.fps = self.frame_count / elapsed
-                self.frame_count = 0
-                self.fps_start_time = time.time()
+            for i, camera in enumerate(data):
+                self.frame_objs[i]["frame_count"] += 1
+                elapsed = time.time() - self.frame_objs[i]["fps_start_time"]
 
-            frame = data["frame"]
-            items = data["items"]
-            for item in items:
-                track_id = item["id"]
-                x1 = item["x1"]
-                y1 = item["y1"]
-                x2 = item["x2"]
-                y2 = item["y2"]
-                fx1 = item["fx1"]
-                fx2 = item["fx2"]
-                fy1 = item["fy1"]
-                fy2 = item["fy2"]
+                if elapsed >= 1.0:
+                    self.frame_objs[i]["fps"] = self.frame_objs[i]["frame_count"] / elapsed
+                    self.frame_objs[i]["frame_count"] = 0
+                    self.frame_objs[i]["fps_start_time"] = time.time()
 
-                person = self.people_manager.get_person(track_id)
-                color = self.get_color(person)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                if fx1 is not None:
-                    cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), color, 2)
+                # Support both raw frames and YOLO-processed frames.
+                if "capture" in camera:
+                    # Frame from Detection
+                    capture = camera["capture"]
+                    items = camera.get("items")
+                else:
+                    capture = camera
+                    items = None
 
-                label = f"{person.name} (Person {person.identity_id} - ID {person.track_id})"
-                cv2.putText(frame, label, (x1, max(y1 - 10, 25)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                frame = capture["frame"].copy()
+                camera_index = capture["camera"]
 
-            fps_text = f"FPS: {self.fps:.1f}"
+                if items is not None and self.people_manager is not None:
+                    for item in items:
+                        track_id = item["id"]
+                        x1 = item["x1"]
+                        y1 = item["y1"]
+                        x2 = item["x2"]
+                        y2 = item["y2"]
+                        fx1 = item["fx1"]
+                        fx2 = item["fx2"]
+                        fy1 = item["fy1"]
+                        fy2 = item["fy2"]
 
-            (text_width, text_height), baseline = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-            cv2.rectangle(frame, (10, 10), (20 + text_width, 20 + text_height + baseline), (0, 0, 0), -1)
+                        person = self.people_manager.get_person(camera_index, track_id)
+                        color = self.get_color(person)
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        if fx1 is not None:
+                            cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), color, 2)
 
-            cv2.putText(frame, fps_text, (15, 15 + text_height), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                        label = f"{person.name} (Person {person.identity_id} - ID {person.track_ids[i]})"
+                        cv2.putText(frame, label, (x1, max(y1 - 10, 25)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                frame = cv2.resize(frame, (640, 360))
 
-            cv2.imshow("Person Recognizer", frame)
+                fps_text = f"{camera_index} - FPS: {self.frame_objs[i]['fps']:.1f}"
+
+                (text_width, text_height), baseline = cv2.getTextSize(fps_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+                cv2.rectangle(frame, (10, 10), (20 + text_width, 20 + text_height + baseline), (0, 0, 0), -1)
+
+                cv2.putText(frame, fps_text, (15, 15 + text_height), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                frame_list.append(frame)
+
+            combined = cv2.hconcat(frame_list)
+            cv2.imshow("Person Recognizer", combined)
+
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 self.running = False
 
