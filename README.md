@@ -12,11 +12,13 @@ people and their estimated face regions in an OpenCV window.
 - Matches a person to a previous track using a clothing-appearance histogram.
 - Periodically verifies detected faces against the configured reference image
   using DeepFace.
+- Uses a stereo camera pair to match keypoints and determine whether detections
+  belong to the same person.
 - Displays bounding boxes, face regions, person identities, and processing FPS.
 
 The application uses separate threads for frame capture, detection, face
-verification, and display. Queues between the threads keep the newest frames
-available when processing cannot keep up with the camera.
+verification, stereo vision, and display. Queues between the threads keep the
+newest frames available when processing cannot keep up with the cameras.
 
 ## Project structure
 
@@ -30,6 +32,18 @@ vectra/
 ├── requirements-trt.txt        # Model export dependencies
 └── known_faces/
     ├── name_1.jpg             # Reference images used for face verification
+└── calibration/
+    ├── calibration.py         # Calculates the calibration data from images
+    ├── calibration_images_taker.py  # Captures an image from both cameras and saves it
+    ├── calibration_images/    # Holds the images used for calibration
+        ├── left_camera/
+            ├── 001.png
+        ├── right_camera/
+            ├── 001.png
+    └── print-board/           # Contains the files for a web application that displays a printable board
+        ├── index.html
+        ├── main.js
+        ├── style.css
 ```
 
 ## Main files
@@ -47,6 +61,8 @@ This file contains the main application classes:
   appearance histograms, and face-verification results.
 - `FaceDetector` loads reference face embeddings and verifies face crops in a
   separate thread.
+- `StereoVision` uses stereo calibration data to match detections between the
+  left and right cameras.
 - `Display` draws person and face bounding boxes, names, camera indexes, and
   FPS information.
 
@@ -82,6 +98,16 @@ Run it only when the engine file needs to be created or regenerated.
 The YOLO pose model is a local runtime dependency. The TensorRT engine used by
 the application is generated from `yolo11m-pose.pt` with `export_model.py` and
 must be available in the project directory before running `main.py`.
+
+### `calibration/`
+
+The stereo calibration workflow is optional unless `StereoVision` is enabled.
+
+1. Print or display the board from `print-board/`.
+2. Capture synchronized calibration images with
+   `calibration_images_taker.py`.
+3. Run `calibration.py` to generate `stereo_calibration.npz`.
+4. Configure `calibration_data` in `main.py` with the generated file.
 
 ## Requirements
 
@@ -123,6 +149,13 @@ Add one or more reference images for verification to:
 
 ```text
 Vectra/known_faces/
+```
+
+If you use stereo vision, serve the printable board first:
+
+```powershell
+npm install
+npm run dev
 ```
 
 Place the required model files in the `vectra` directory:

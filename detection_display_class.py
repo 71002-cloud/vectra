@@ -133,9 +133,47 @@ class PeopleManager:
 
             self.people.pop(person.identity_id, None)
 
-            print(f"Merged: Person {person.identity_id} "
+            print(f"Merged: Person {person.identity_id} - based on face"
                   f"into {candidate.identity_id} "
                   f"(name={name})")
+
+    def link_people(self, track_id1, camera_index1, track_id2, camera_index2):
+        person = self.get_person(camera_index1, track_id1)
+        person1 = self.get_person(camera_index2, track_id2)
+
+        if person is None or person1 is None:
+            return
+
+        if person is person1:
+            return
+
+        if (person.verified and person1.verified
+                and person.name != person1.name):
+            return
+
+        if person1.verified and not person.verified:
+            person, person1 = person1, person
+
+        # Transfer camera tracks and appearances
+        for i in range(self.camera_amount):
+            old_track_id = person1.track_ids[i]
+
+            if old_track_id is not None:
+                person.track_ids[i] = old_track_id
+                self.track_to_person[(i, old_track_id)] = person
+
+            if person1.appearance[i] is not None:
+                person.appearance[i] = person1.appearance[i]
+
+        person.last_seen = max(person.last_seen, person1.last_seen)
+        person.last_face_check = max(person.last_face_check, person1.last_face_check)
+
+        self.people.pop(person1.identity_id, None)
+
+        print(
+            f"Merged: Person {person1.identity_id} - based on stereo "
+            f"into {person.identity_id} "
+            f"(name={person.name})")
 
     def get_people(self):
         return self.people
@@ -172,14 +210,13 @@ class FaceDetector:
 
             if name not in self.reference_embeddings:
                 self.reference_embeddings[name] = []
-                try:
-                    result = DeepFace.represent(img_path=image_path, model_name="Facenet", detector_backend="opencv", enforce_detection=True)
-                    embedding = result[0]["embedding"]
-                    self.reference_embeddings[name].append(embedding)
+            try:
+                result = DeepFace.represent(img_path=image_path, model_name="Facenet", detector_backend="opencv", enforce_detection=True)
+                embedding = result[0]["embedding"]
+                self.reference_embeddings[name].append(embedding)
 
-                except ValueError as e:
-                    print(f"Error occurred while processing {image_path}: {e}")
-                    continue
+            except ValueError as e:
+                print(f"Error occurred while processing {image_path}: {e}")
 
     @staticmethod
     def compare_embeddings(embedding1, embedding2):
@@ -248,10 +285,11 @@ class FaceDetector:
             self.thread.join(timeout=2.0)
 
 class FrameCapture:
-    def __init__(self, camera_index, camera_amount, queue_size):
+    def __init__(self, camera_index, camera_amount, queue_size, stereo_list=None):
         self.camera_index = camera_index
         self.frame_queue = queue.Queue(maxsize=queue_size)
         self.camera_amount = camera_amount
+        self.stereo_list = stereo_list
 
         self.cameras: list[cv2.VideoCapture | None] = [None] * camera_amount
         self.thread = None
@@ -297,10 +335,16 @@ class FrameCapture:
                 if not success:
                     print(f"Camera {self.camera_index[i]} failed to read a frame")
                     continue
+                stereo = None
+                if self.stereo_list is not None:
+                    for j in range(len(self.stereo_list)):
+                        if self.camera_index[i] in self.stereo_list[j]:
+                            stereo = self.stereo_list[j]
 
                 frame_data = {
                     "frame": frame,
                     "camera": self.camera_index[i],
+                    "stereo": stereo,
                     "timestamp": time.perf_counter()
                 }
 
@@ -468,6 +512,7 @@ class Detection:
                 camera_index = frame_data["camera"]
                 camera = {"capture": frame_data}
                 items = []
+                position_points = []
 
                 frame_height, frame_width = frame.shape[:2]
                 tracker = self.trackers[camera_index]
@@ -476,11 +521,12 @@ class Detection:
                 tracks = tracker.update(detections, frame)
                 current_track_ids = {int(track[4]) for track in tracks}
                 keypoints = None
+                face_keypoints = None
                 if result.keypoints is not None:
-                    keypoints = result.keypoints.xy[:, :5].cpu().numpy()
+                    keypoints = result.keypoints.xy[:, [0, 1, 2, 3, 4, 5, 6, 11, 12]].cpu().numpy()
+                    face_keypoints = keypoints[:, :5].copy()
 
                 for track in tracks:
-
                     x1, y1, x2, y2 = map(int, track[:4])
                     track_id = int(track[4])
                     detections_index = int(track[7])
@@ -503,8 +549,8 @@ class Detection:
                     person = self.people_manager.update_person(track_id, appearance, current_track_ids, camera_index)
 
                     face_xxyy = None
-                    if keypoints is not None and 0 <= detections_index < len(keypoints):
-                        face_xxyy = self.get_face_crop_xxyy(frame, keypoints[detections_index])
+                    if keypoints is not None and 0 <= detections_index < len(face_keypoints):
+                        face_xxyy = self.get_face_crop_xxyy(frame, face_keypoints[detections_index])
 
                     fx1, fx2, fy1, fy2 = None, None, None, None
                     if face_xxyy is not None:
@@ -522,6 +568,13 @@ class Detection:
                                 person.last_face_check = current_time
                             except queue.Full:
                                 pass
+                    
+                    left_shoulder, right_shoulder, left_hip, right_hip = None, None, None, None
+                    if keypoints is not None and 0 <= detections_index < len(keypoints):
+                        left_shoulder = keypoints[detections_index][5]
+                        right_shoulder = keypoints[detections_index][6]
+                        left_hip = keypoints[detections_index][7]
+                        right_hip = keypoints[detections_index][8]
 
                     item = {
                         "id": track_id,
@@ -534,8 +587,16 @@ class Detection:
                         "fy1": fy1,
                         "fy2": fy2
                     }
+                    points = {
+                        "left_shoulder": left_shoulder,
+                        "right_shoulder": right_shoulder,
+                        "left_hip": left_hip,
+                        "right_hip": right_hip
+                    }
                     items.append(item)
+                    position_points.append(points)
                 camera["items"] = items
+                camera["position_points"] = position_points
                 payload.append(camera)
 
             if self.frame_queue.full():
@@ -551,6 +612,238 @@ class Detection:
 
             if refresh_appearances:
                 self.appearance_frame_count = 0
+
+    def get_frame(self, timeout=1.0):
+        try:
+            return self.frame_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def stop(self):
+        self.running = False
+
+        if self.thread is not None:
+            self.thread.join(timeout=2.0)
+
+# It works for multiple cameras if they have the same calibration data.
+# Will need to be modified if each camera has different calibration data.
+class StereoVision:
+    def __init__(self, detection, people_manager, queue_size, calibration_data):
+        self.detection = detection
+        self.people_manager = people_manager
+        self.frame_queue = queue.Queue(maxsize=queue_size)
+
+        self.calibration_data = calibration_data
+        self.K1 = None
+        self.D1 = None
+        self.K2 = None
+        self.D2 = None
+        self.F = None
+
+        self.running = False
+        self.thread = None
+
+    def start(self):
+        data = np.load(self.calibration_data)
+
+        self.K1 = data["left_matrix"]
+        self.D1 = data["left_distortion"]
+        self.K2 = data["right_matrix"]
+        self.D2 = data["right_distortion"]
+        self.F = data["F"]
+
+        self.running = True
+        self.thread = threading.Thread(target=self._stereo_loop, daemon=True)
+        self.thread.start()
+
+        return self
+
+    def get_epipolar_line(self, x, y, side):  # 0 == left, 1 == right
+        point = np.array([x, y, 1.0])
+
+        if side == 0:
+            line = self.F @ point
+        else:
+            line = self.F.T @ point
+
+        return line  # Gives the values a, b, c used in distance
+
+    @staticmethod
+    def distance(a, b, c, x2, y2):
+        return abs(a*x2 + b*y2 + c) / np.sqrt(a*a + b*b)
+
+    def undistort_point(self, point, camera_index, left_camera_index):
+        if point is None:
+            return None
+
+        x, y = point[0], point[1]
+        if not np.isfinite(x) or not np.isfinite(y) or x <= 0 or y <= 0:
+            return None
+
+        if camera_index == left_camera_index:
+            matrix = self.K1
+            distortion = self.D1
+        else:
+            matrix = self.K2
+            distortion = self.D2
+
+        distorted_point = np.array([[[x, y]]], dtype=np.float32)
+        undistorted_point = cv2.undistortPoints(
+            distorted_point,
+            matrix,
+            distortion,
+            P=matrix
+        )
+
+        return undistorted_point.reshape(2)
+
+    def _stereo_loop(self):
+        while self.running:
+            data = self.detection.get_frame()
+            if data is None:
+                continue
+
+            stereo_pair = {}
+
+            for camera in data:
+                capture = camera["capture"]
+                position_points = camera["position_points"]
+                items = camera["items"]
+                if capture["stereo"] is None:
+                    continue
+                pair_key = tuple(capture["stereo"])
+                # Save the first camera in the pair.
+                if stereo_pair.get(pair_key) is None:
+                    info = {
+                        "camera_index": capture["camera"],
+                        "position_points": position_points,
+                        "items": items,
+                        "stereo": capture["stereo"]
+                    }
+                    stereo_pair[pair_key] = info
+                    continue
+                
+                # If the second camera in the pair is found, calculate the match.
+                right_camera_index = capture["stereo"][1]
+                left_camera_index = capture["stereo"][0]
+                lines_list = []
+
+                if capture["camera"] == left_camera_index:
+                    left_position_points = position_points
+                    left_items = items
+                    info = stereo_pair[pair_key]
+                    right_position_points = info["position_points"]
+                    right_items = info["items"]
+                else:
+                    right_position_points = position_points
+                    right_items = items
+                    info = stereo_pair[pair_key]
+                    left_position_points = info["position_points"]
+                    left_items = info["items"]
+
+                # Calculate epipolar lines for each detected person in the left camera.
+                for item, points in zip(left_items, left_position_points):
+                    track_id = item["id"]
+                    lines = {}
+                    for point_name, point in points.items():
+                        undistorted_point = self.undistort_point(
+                            point,
+                            left_camera_index,
+                            left_camera_index
+                        )
+                        if undistorted_point is None:
+                            continue
+
+                        line = self.get_epipolar_line(
+                            undistorted_point[0],
+                            undistorted_point[1],
+                            0
+                        )
+                        lines[point_name] = line
+
+                    obj = {
+                        "id": track_id,
+                        "camera": left_camera_index,
+                        "lines": lines
+                        }
+                    lines_list.append(obj)
+                
+                # Match right-camera detections with left-camera epipolar lines.
+                distance_list = []
+                for item, points in zip(right_items, right_position_points):
+                    track_id = item["id"]
+                    for element in lines_list:
+                        other_camera = element["camera"]
+                        other_id = element["id"]
+                        lines = element["lines"]
+                        distances = []
+                        for point_name, line in lines.items():
+                            point = points.get(point_name)
+                            undistorted_point = self.undistort_point(
+                                point,
+                                right_camera_index,
+                                left_camera_index
+                            )
+                            if undistorted_point is None:
+                                continue
+
+                            x = undistorted_point[0]
+                            y = undistorted_point[1]
+                            a, b, c = line
+                            distance = self.distance(a, b, c, x, y)
+                            if np.isfinite(distance):
+                                distances.append(distance)
+
+                        if not distances:
+                            continue
+
+                        obj = {
+                            "camera1": other_camera,
+                            "id1": other_id,
+                            "camera2": right_camera_index,
+                            "id2": track_id,
+                            "distances": distances
+                        }
+                        distance_list.append(obj)
+
+                # Match detections based on the average distance to epipolar lines.
+                threshold = 18.0  # pixels
+
+                for match in distance_list:
+                    match["score"] = np.mean(match["distances"])
+
+                distance_list.sort(key=lambda candidate: candidate["score"])
+
+                matches = []
+                used_left = set()
+                used_right = set()
+                for match in distance_list:
+                    print(match["score"])
+                    if match["score"] > threshold:
+                        continue
+
+                    if match["id1"] in used_left or match["id2"] in used_right:
+                        continue
+
+                    matches.append(match)
+
+                    used_left.add(match["id1"])
+                    used_right.add(match["id2"])
+
+                for match in matches:
+                    # Link the detections so the program knows they are the same person.
+                    self.people_manager.link_people(match["id1"], match["camera1"], match["id2"], match["camera2"])
+
+            if self.frame_queue.full():
+                try:
+                    self.frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+
+            try:
+                self.frame_queue.put_nowait(data)
+            except queue.Full:
+                pass
 
     def get_frame(self, timeout=1.0):
         try:
