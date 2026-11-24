@@ -89,4 +89,6 @@ np.savez(
     right_matrix=right_matrix,
     right_distortion=right_distortion,
     R=R,
-    T=T)
+    T=T,
+    E=E,
+    F=F)
